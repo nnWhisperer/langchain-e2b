@@ -1,0 +1,153 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  UPSTREAM_REPOSITORY: e2b-dev/langchain-e2b
+  UPSTREAM_BRANCH: main
+  FORK_BRANCH: fix/pass-e2b-api-url
+  AUTOMATION_BRANCH: main
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    environment: actions-env
+    steps:
+      - name: Check out the default automation branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure Git and fetch branches
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --no-tags origin \
+            "+refs/heads/${FORK_BRANCH}:refs/remotes/origin/${FORK_BRANCH}" \
+            "+refs/heads/${AUTOMATION_BRANCH}:refs/remotes/origin/${AUTOMATION_BRANCH}"
+          git fetch --no-tags upstream \
+            "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}"
+
+      - name: Merge maintained branches
+        id: merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          push_branch() {
+            local branch="$1"
+            local authorization
+            authorization="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+            git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${authorization}" \
+              push origin "HEAD:refs/heads/${branch}"
+          }
+
+          record_conflict() {
+            local target="$1"
+            local incoming="$2"
+            {
+              echo "conflict=true"
+              echo "failed_branch=${target}"
+              echo "incoming_ref=${incoming}"
+              echo "incoming_sha=$(git rev-parse "${incoming}")"
+            } >> "$GITHUB_OUTPUT"
+          }
+
+          git switch --force-create "$FORK_BRANCH" "origin/$FORK_BRANCH"
+          if ! git merge --no-ff --no-edit "upstream/$UPSTREAM_BRANCH"; then
+            record_conflict "$FORK_BRANCH" "upstream/$UPSTREAM_BRANCH"
+            exit 0
+          fi
+          make lint
+          make test
+          push_branch "$FORK_BRANCH"
+
+          git switch --force-create "$AUTOMATION_BRANCH" "origin/$AUTOMATION_BRANCH"
+          if ! git merge --no-ff --no-edit "$FORK_BRANCH"; then
+            record_conflict "$AUTOMATION_BRANCH" "$FORK_BRANCH"
+            exit 0
+          fi
+          make lint
+          make test
+          push_branch "$AUTOMATION_BRANCH"
+          echo "conflict=false" >> "$GITHUB_OUTPUT"
+
+      - name: Repair merge conflicts with Deep Agents Code
+        if: steps.merge.outputs.conflict == 'true'
+        uses: langchain-ai/deepagents@8da0ccb139b8ccc4438a7522499a257a44f1cf19
+        with:
+          prompt: |
+            Resolve the currently pending upstream synchronization merge.
+            Read UPSTREAM_SYNC_SPEC.md completely before editing.
+            The failed target is ${{ steps.merge.outputs.failed_branch }} and
+            the incoming ref is ${{ steps.merge.outputs.incoming_ref }}.
+            Preserve upstream behavior unless Section A explicitly overrides it.
+            Resolve only this merge and necessary related breakage. Do not commit,
+            push, rewrite history, use GitHub APIs, or change workflow/security
+            configuration. Leave a coherent, uncommitted merge with no unresolved
+            paths. Run focused validation when useful; deterministic validation
+            follows after you return.
+          model: ${{ vars.DEEP_AGENT_MODEL }}
+          openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          google_api_key: ${{ secrets.GOOGLE_API_KEY }}
+          github_token: ""
+          enable_memory: "false"
+          shell_allow_list: recommended,git
+          timeout: "30"
+
+      - name: Validate and publish repair pull request
+        if: steps.merge.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FAILED_BRANCH: ${{ steps.merge.outputs.failed_branch }}
+          INCOMING_REF: ${{ steps.merge.outputs.incoming_ref }}
+          INCOMING_SHA: ${{ steps.merge.outputs.incoming_sha }}
+        run: |
+          set -euo pipefail
+          test -f .git/MERGE_HEAD
+          test -z "$(git diff --name-only --diff-filter=U)"
+          test "$(git branch --show-current)" = "$FAILED_BRANCH"
+
+          make lint
+          make test
+          git commit --no-edit
+          git merge-base --is-ancestor "$INCOMING_SHA" HEAD
+
+          safe_target="${FAILED_BRANCH//\//-}"
+          repair_branch="sync-repair-${safe_target}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          authorization="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${authorization}" \
+            push origin "HEAD:refs/heads/${repair_branch}"
+
+          gh pr create \
+            --base "$FAILED_BRANCH" \
+            --head "$repair_branch" \
+            --title "fix: repair upstream sync into ${FAILED_BRANCH}" \
+            --body "Automated conflict-repair proposal.
+
+          - Failed target: \`${FAILED_BRANCH}\`
+          - Incoming ref: \`${INCOMING_REF}\`
+          - Incoming commit: \`${INCOMING_SHA}\`
+          - Validation: \`make lint\`, \`make test\`
+          - Repair performed by Deep Agents Code; publication performed by deterministic workflow steps.
+
+          Human review is required before merge."
